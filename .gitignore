@@ -1,0 +1,11 @@
+database/*.db
+database/*.db-wal
+database/*.db-shm
+data/pdfs/
+logs/
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+.env.local
