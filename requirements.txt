@@ -1,0 +1,22 @@
+# ─── Core del sistema ───────────────────────────────────────────────────────
+feedparser==6.0.11           # Parseo de feeds ATOM/RSS
+beautifulsoup4==4.12.3       # Parseo de HTML embebido en summaries
+lxml==5.2.1                  # Parser HTML más rápido para BeautifulSoup
+sqlalchemy==2.0.30           # ORM para SQLite (y futuras migraciones a PostgreSQL)
+
+# ─── Step 2: Descarga y navegación de pliegos ────────────────────────────────
+requests==2.32.3             # HTTP para descargar PDFs
+playwright==1.44.0           # Navegación headless (futuro: páginas con JS)
+
+# ─── Step 3 / 4: IA local y cloud ────────────────────────────────────────────
+ollama==0.2.1                # Cliente Python para Ollama/Llama 4 local
+openai==1.35.7               # Cliente para GPT-5 (Step 5)
+google-generativeai==0.7.2   # Gemini 1.5 Pro para OCR de PDFs escaneados
+pypdf==4.3.1                 # Extracción de texto de PDFs digitales
+pymupdf==1.24.5              # Alternativa más potente para PDFs (fitz)
+
+# ─── Utilidades ──────────────────────────────────────────────────────────────
+python-dotenv==1.0.1         # Variables de entorno (.env) para producción
+tenacity==8.4.1              # Reintentos declarativos (refactor futuro del scraper)
+rich==13.7.1                 # Output bonito en terminal (opcional pero recomendado)
+schedule==1.2.2              # Scheduler para ejecuciones automáticas
