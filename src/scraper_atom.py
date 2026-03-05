@@ -3,14 +3,16 @@ src/scraper_atom.py — Sabueso de Licitaciones
 ===============================================
 Motor de ingesta del feed ATOM de la PCSP.
 
-Responsabilidades:
-  1. Descargar y parsear el feed ATOM con feedparser
-  2. Limpiar y estructurar cada entrada en un LicitacionSchema válido
-  3. Gestionar reintentos con backoff exponencial (via tenacity)
-  4. NO escribir en BD (eso es responsabilidad de db_manager)
-  
-Principio de responsabilidad única: este módulo solo produce datos,
-no los persiste. Esto facilita los tests unitarios y el reemplazo.
+Responsabilidades (y SOLO estas):
+  · Descargar el feed con reintentos y backoff exponencial.
+  · Parsear cada entrada en un LicitacionSchema validado.
+  · Producir los schemas uno a uno (generador) para que main.py
+    los pase al DatabaseManager.
+
+Lo que NO hace este módulo:
+  · Escribir en BD (eso es db_manager.py).
+  · Formatear output (eso es main.py).
+  · Limpiar HTML o parsear fechas (eso es utils.py).
 """
 
 from __future__ import annotations
@@ -22,39 +24,43 @@ from typing import Iterator, Optional
 
 import feedparser
 import requests
+from requests.adapters import HTTPAdapter
 from tenacity import (
+    before_sleep_log,
     retry,
+    retry_if_exception_type,
     stop_after_attempt,
     wait_exponential,
-    retry_if_exception_type,
-    before_sleep_log,
 )
+from urllib3.util.retry import Retry
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 import config
 from src.logger import get_logger
 from src.models import LicitacionSchema
-from src.utils import parsear_fecha, parsear_summary_pcsp, limpiar_texto
+from src.utils import limpiar_texto, parsear_fecha, parsear_summary_pcsp
 
 logger = get_logger(__name__)
 
 
 class PCPSFeedError(Exception):
-    """Excepción específica para errores del feed PCSP."""
+    """Error específico del feed PCSP. Permite captura selectiva en main.py."""
     pass
 
 
 class AtomScraper:
     """
-    Scraper del feed ATOM de la Plataforma de Contratación del Sector Público.
-    
-    Diseñado para ser stateless: no almacena resultados, solo los produce.
-    La gestión de estado y persistencia es responsabilidad del DatabaseManager.
-    
+    Scraper stateless del feed ATOM de la PCSP.
+
+    Stateless significa que no guarda resultados entre llamadas.
+    Cada llamada a iterar_licitaciones() hace una descarga fresca del feed.
+    Esto garantiza que siempre procesamos las licitaciones más recientes.
+
     Ejemplo de uso:
-        scraper = AtomScraper(config.PCSP_FEEDS["completo"])
-        for licitacion in scraper.iterar_licitaciones(limite=20):
-            db.insertar_licitacion(session, licitacion)
+        scraper = AtomScraper(feed_url=config.PCSP_FEEDS["completo"])
+        for schema in scraper.iterar_licitaciones(limite=20):
+            with db.session() as s:
+                db.insertar_licitacion(s, schema)
     """
 
     def __init__(
@@ -66,26 +72,28 @@ class AtomScraper:
         self.feed_url = feed_url
         self.timeout = timeout
         self.delay = delay
-        self._session = self._crear_sesion_http()
-        logger.info(f"AtomScraper inicializado para: {feed_url}")
+        self._http = self._crear_sesion_http()
+        logger.info("AtomScraper listo para: %s", feed_url)
 
     def _crear_sesion_http(self) -> requests.Session:
         """
-        Crea una sesión HTTP con headers y configuración de producción.
-        Usar Session (no requests.get directo) permite reutilizar conexiones TCP.
+        Sesión HTTP con:
+          · Headers realistas (evita bloqueos 403 del servidor PCSP).
+          · Retry a nivel de transporte para errores de red transitoria.
+          · Reutilización de conexiones TCP (más eficiente que requests.get()).
         """
         session = requests.Session()
         session.headers.update(config.HTTP_HEADERS)
-        # Retry a nivel de transporte para errores de red de bajo nivel
-        from requests.adapters import HTTPAdapter
-        from urllib3.util.retry import Retry
-        retry_strategy = Retry(
+
+        # Retry de bajo nivel (urllib3): solo para errores de transporte
+        # Los errores HTTP (4xx, 5xx) los gestiona tenacity en _descargar_feed
+        transport_retry = Retry(
             total=2,
             backoff_factor=0.5,
             status_forcelist=[429, 500, 502, 503, 504],
             allowed_methods=["GET"],
         )
-        adapter = HTTPAdapter(max_retries=retry_strategy)
+        adapter = HTTPAdapter(max_retries=transport_retry)
         session.mount("https://", adapter)
         session.mount("http://", adapter)
         return session
@@ -94,125 +102,118 @@ class AtomScraper:
         stop=stop_after_attempt(config.MAX_RETRIES),
         wait=wait_exponential(multiplier=1, min=2, max=30),
         retry=retry_if_exception_type((requests.RequestException, PCPSFeedError)),
-        before_sleep=before_sleep_log(logger, 20),  # 20 = logging.WARNING
+        before_sleep=before_sleep_log(logger, 30),  # 30 = logging.WARNING
         reraise=True,
     )
     def _descargar_feed(self) -> feedparser.FeedParserDict:
         """
-        Descarga y parsea el feed ATOM con reintentos automáticos.
-        
-        El decorador @retry de tenacity implementa backoff exponencial:
-        - Intento 1: inmediato
-        - Intento 2: espera ~2s
-        - Intento 3: espera ~4s
+        Descarga y parsea el feed ATOM con backoff exponencial automático.
+
+        Estrategia de dos capas:
+          1. requests descarga el contenido (control de headers/timeout).
+          2. feedparser parsea el XML (robusto ante XML mal formado).
+
+        El decorador @retry de tenacity implementa:
+          - Intento 1: inmediato
+          - Intento 2: espera ~2s
+          - Intento 3: espera ~4s
+          - Si los 3 fallan: relanza la excepción
         """
-        logger.info(f"Descargando feed: {self.feed_url}")
+        logger.info("Descargando feed PCSP...")
 
         try:
-            # Usamos requests para tener control sobre headers y timeout,
-            # luego pasamos el contenido a feedparser para el parsing XML
-            response = self._session.get(self.feed_url, timeout=self.timeout)
-            response.raise_for_status()
-        except requests.HTTPError as e:
-            logger.error(f"HTTP {e.response.status_code} al descargar feed: {e}")
-            raise PCPSFeedError(f"HTTP error: {e.response.status_code}") from e
-        except requests.ConnectionError as e:
-            logger.error(f"Error de conexión al feed PCSP: {e}")
-            raise  # tenacity reintentará
+            resp = self._http.get(self.feed_url, timeout=self.timeout)
+            resp.raise_for_status()
+        except requests.HTTPError as exc:
+            status = exc.response.status_code if exc.response else "?"
+            logger.error("HTTP %s descargando feed: %s", status, exc)
+            raise PCPSFeedError(f"HTTP {status}") from exc
+        except requests.ConnectionError as exc:
+            logger.warning("Error de conexión (reintentando): %s", exc)
+            raise
         except requests.Timeout:
-            logger.warning(f"Timeout ({self.timeout}s) descargando feed")
+            logger.warning("Timeout (%ss) descargando feed (reintentando)", self.timeout)
             raise
 
-        # Pasar el contenido raw a feedparser evita que feedparser
-        # haga su propia petición HTTP (perdiendo nuestros headers)
+        # Pasamos el contenido raw a feedparser para que use nuestros headers
         feed = feedparser.parse(
-            response.content,
-            response_headers={"content-type": response.headers.get("content-type", "")},
+            resp.content,
+            response_headers={"content-type": resp.headers.get("content-type", "")},
         )
 
-        # Verificar que el feed sea válido
-        if feed.bozo and feed.bozo_exception:
-            # bozo=True significa que feedparser detectó XML mal formado
-            # Algunos feeds tienen bozo pero aún son parseables (bozo_exception suave)
-            bozo_msg = str(feed.bozo_exception)
-            if not feed.entries:
-                logger.error(f"Feed inválido (bozo): {bozo_msg}")
-                raise PCPSFeedError(f"Feed XML inválido: {bozo_msg}")
-            else:
-                logger.warning(f"Feed con advertencias XML (bozo): {bozo_msg} — continuando")
+        if feed.bozo and not feed.entries:
+            raise PCPSFeedError(f"Feed XML inválido: {feed.bozo_exception}")
+        elif feed.bozo:
+            logger.warning("Feed con advertencias XML: %s — continuando", feed.bozo_exception)
 
-        total = len(feed.entries)
-        if total == 0:
-            logger.warning("El feed retornó 0 entradas. ¿URL correcta? ¿Servicio caído?")
-        else:
-            logger.info(
-                f"Feed descargado: {total} entradas | "
-                f"Título: {feed.feed.get('title', 'N/A')}"
-            )
-
+        logger.info(
+            "Feed descargado: %d entradas | Título: %s",
+            len(feed.entries),
+            feed.feed.get("title", "N/A"),
+        )
         return feed
 
     def _parsear_entrada(self, entry: feedparser.util.FeedParserDict) -> Optional[LicitacionSchema]:
         """
-        Transforma una entrada del feed en un LicitacionSchema validado.
-        
-        El feed PCSP tiene campos estándar ATOM + campos extendidos propios.
-        El campo 'summary' contiene una tabla HTML con los detalles.
+        Convierte una entrada cruda de feedparser en un LicitacionSchema.
+
+        Devuelve None si la entrada no tiene los campos mínimos requeridos
+        (id y título), en lugar de lanzar excepción, para que el bucle
+        en iterar_licitaciones() pueda continuar con la siguiente.
         """
         try:
-            # --- ID (campo crítico: si no hay ID, la entrada es inútil) ---
-            entry_id = getattr(entry, "id", None) or entry.get("id")
+            # — ID: campo crítico sin el que la entrada es inútil —
+            entry_id = entry.get("id") or entry.get("link")
             if not entry_id:
-                logger.warning(f"Entrada sin ID, omitiendo: {entry.get('title', 'N/A')[:50]}")
+                logger.warning("Entrada sin ID omitida: %s", entry.get("title", "?")[:50])
                 return None
 
-            # --- Título ---
+            # — Título —
             titulo = limpiar_texto(entry.get("title")) or "Sin título"
 
-            # --- Link principal ---
+            # — Link: puede venir como string o como lista de dicts —
             link = entry.get("link")
             if not link and entry.get("links"):
-                # feedparser puede devolver lista de links
                 link = next(
-                    (l.href for l in entry.links if l.get("rel") == "alternate"),
+                    (lk.href for lk in entry.links if lk.get("rel") == "alternate"),
                     entry.links[0].href if entry.links else None,
                 )
 
-            # --- Fechas ---
-            fecha_pub = parsear_fecha(
-                entry.get("published") or entry.get("updated")
-            )
+            # — Fechas —
+            fecha_pub = parsear_fecha(entry.get("published") or entry.get("updated"))
             fecha_act = parsear_fecha(entry.get("updated"))
 
-            # --- Author → Órgano de contratación (campo ATOM estándar) ---
-            organo_raw = entry.get("author") or ""
+            # — Órgano de contratación (campo ATOM: author) —
+            organo_raw = ""
             if hasattr(entry, "author_detail") and entry.author_detail:
-                organo_raw = entry.author_detail.get("name", organo_raw)
+                organo_raw = entry.author_detail.get("name", "")
+            if not organo_raw:
+                organo_raw = entry.get("author", "")
 
-            # --- Parsear el HTML del summary para campos adicionales ---
+            # — Summary HTML: fuente principal de metadatos enriquecidos —
             summary_html = entry.get("summary", "")
             campos_extra = parsear_summary_pcsp(summary_html)
 
-            # El órgano del summary tiene prioridad sobre el campo author del ATOM
+            # El órgano del summary tiene prioridad sobre el campo 'author' del ATOM
             organo_final = campos_extra.pop("organo_contratacion", None) or limpiar_texto(organo_raw)
 
-            # --- Construir y validar el schema ---
-            schema = LicitacionSchema(
+            return LicitacionSchema(
                 id=entry_id,
                 titulo=titulo,
                 link_plataforma=link,
                 fecha_publicacion=fecha_pub,
                 fecha_actualizacion=fecha_act,
                 organo_contratacion=organo_final,
-                raw_summary_html=summary_html[:5000] if summary_html else None,  # Limitar tamaño
-                **campos_extra,  # presupuesto_base, tipo_contrato, cpv, etc.
+                raw_summary_html=summary_html[:5000] if summary_html else None,
+                **campos_extra,
             )
-            return schema
 
-        except Exception as e:
+        except Exception as exc:
             logger.error(
-                f"Error parseando entrada '{entry.get('title', 'N/A')[:50]}': "
-                f"{type(e).__name__}: {e}"
+                "Error parseando entrada '%s': %s: %s",
+                entry.get("title", "?")[:50],
+                type(exc).__name__,
+                exc,
             )
             return None
 
@@ -222,61 +223,49 @@ class AtomScraper:
     ) -> Iterator[LicitacionSchema]:
         """
         Generador principal: descarga el feed y produce LicitacionSchema uno a uno.
-        
-        Usar un generador (yield) en lugar de retornar una lista permite:
-          - Procesar entradas mientras se siguen descargando (pipeline)
-          - Controlar la memoria en feeds grandes
-          - Aplicar rate limiting entre entradas fácilmente
-        
-        Args:
-            limite: Máximo de entradas a procesar. None = todas.
-        
-        Yields:
-            LicitacionSchema para cada entrada válida del feed
+
+        Usar yield en lugar de return lista:
+          · Permite procesar y persistir cada licitación antes de parsear la siguiente.
+          · Controla el uso de memoria en feeds con cientos de entradas.
+          · Facilita el rate-limiting entre peticiones.
+
+        Raises:
+            PCPSFeedError: si el feed no se puede descargar tras todos los reintentos.
         """
         feed = self._descargar_feed()
-        entradas = feed.entries
-        
-        if limite is not None:
-            entradas = entradas[:limite]
-            logger.info(f"Procesando las primeras {limite} entradas del feed")
+        entradas = feed.entries[:limite] if limite else feed.entries
 
-        procesadas = 0
-        errores = 0
+        if limite and len(feed.entries) > limite:
+            logger.info("Limitando a %d de %d entradas disponibles.", limite, len(feed.entries))
 
-        for i, entry in enumerate(entradas, 1):
+        validas = errores = 0
+        for i, entry in enumerate(entradas, start=1):
             schema = self._parsear_entrada(entry)
-            
             if schema:
-                procesadas += 1
+                validas += 1
                 yield schema
             else:
                 errores += 1
 
-            # Rate limiting: respetar al servidor de la PCSP
-            # (no aplicar en la última entrada)
+            # Rate limiting: no saturar el servidor de la PCSP
             if i < len(entradas) and self.delay > 0:
                 time.sleep(self.delay)
 
-        logger.info(
-            f"Iteración completada: {procesadas} válidas, "
-            f"{errores} errores de parsing"
-        )
+        logger.info("Parseo completado: %d válidas | %d errores.", validas, errores)
 
     def obtener_metadata_feed(self) -> dict:
         """
-        Retorna metadatos del feed sin procesar las entradas.
-        Útil para healthchecks y monitorización.
+        Metadatos del feed sin procesar las entradas.
+        Útil para healthchecks: python main.py --ping
         """
         try:
             feed = self._descargar_feed()
             return {
+                "ok": True,
                 "titulo": feed.feed.get("title"),
-                "subtitulo": feed.feed.get("subtitle"),
                 "actualizado": feed.feed.get("updated"),
                 "total_entradas": len(feed.entries),
-                "feed_version": feed.version,
-                "bozo": feed.bozo,
+                "version_feed": feed.version,
             }
-        except Exception as e:
-            return {"error": str(e)}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}

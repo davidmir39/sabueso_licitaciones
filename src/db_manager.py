@@ -1,13 +1,17 @@
 """
 src/db_manager.py — Sabueso de Licitaciones
 =============================================
-Gestión de base de datos con SQLAlchemy 2.0.
+Única capa de acceso a la base de datos.
 
-Principios de diseño:
-  - Context Manager para sesiones (garantiza commit/rollback automático)
-  - Idempotencia: INSERT OR IGNORE via merge() de SQLAlchemy
-  - Separación de responsabilidades: este módulo SOLO habla con la BD
-  - Preparado para migración a PostgreSQL cambiando solo DATABASE_URL
+Responsabilidades (y SOLO estas):
+  · Crear/verificar el schema al arrancar.
+  · Proveer un context manager de sesión con commit/rollback automático.
+  · CRUD de licitaciones y log de ejecuciones.
+
+Lo que NO hace este módulo:
+  · Parsear HTML o feeds (eso es utils.py / scraper_atom.py).
+  · Formatear output para consola (eso es main.py).
+  · Decidir qué licitaciones son relevantes (eso será ia_analyzer.py).
 """
 
 from __future__ import annotations
@@ -18,11 +22,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Generator, Optional
 
-from sqlalchemy import create_engine, select, func, update
+from sqlalchemy import create_engine, func, select, update
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
-# Asegurar imports relativos correctos
 sys.path.insert(0, str(Path(__file__).parent.parent))
 import config
 from src.logger import get_logger
@@ -34,72 +37,70 @@ logger = get_logger(__name__)
 class DatabaseManager:
     """
     Gestor centralizado de la base de datos.
-    
-    Uso básico:
+
+    Diseñado para instanciarse una vez en main.py y reutilizarse
+    durante toda la ejecución (no es thread-safe por defecto con SQLite,
+    pero para este caso de uso single-process es suficiente).
+
+    Uso:
         db = DatabaseManager()
         with db.session() as session:
-            licitaciones = db.obtener_pendientes(session)
-    
-    Diseñado para ser instanciado una vez (singleton en main.py)
-    y reutilizado durante toda la ejecución.
+            db.insertar_licitacion(session, schema)
     """
 
     def __init__(self, database_url: str = config.DATABASE_URL):
         self.database_url = database_url
         self._engine = create_engine(
             database_url,
-            echo=False,          # True para ver SQL en desarrollo
-            pool_pre_ping=True,  # Verifica conexión antes de usarla
+            echo=False,
+            pool_pre_ping=True,
             connect_args=(
-                {"check_same_thread": False}
-                if "sqlite" in database_url
-                else {}
+                {"check_same_thread": False} if "sqlite" in database_url else {}
             ),
         )
         self._SessionFactory = sessionmaker(
             bind=self._engine,
-            expire_on_commit=False,  # Permite acceder a atributos post-commit
+            expire_on_commit=False,
         )
         self._inicializar_schema()
-        logger.info(f"DatabaseManager inicializado: {database_url}")
+        logger.info("DatabaseManager listo: %s", database_url)
 
     def _inicializar_schema(self) -> None:
-        """
-        Crea las tablas si no existen. Idempotente.
-        En producción, usa Alembic para migraciones controladas.
-        """
+        """Crea tablas si no existen. Idempotente y seguro en cada arranque."""
         try:
             Base.metadata.create_all(self._engine)
-            logger.debug("Schema verificado/creado correctamente")
-        except SQLAlchemyError as e:
-            logger.critical(f"Error fatal inicializando schema: {e}")
+            logger.debug("Schema de BD verificado correctamente.")
+        except SQLAlchemyError as exc:
+            logger.critical("Error fatal inicializando schema de BD: %s", exc)
             raise
+
+    # ── Context manager de sesión ─────────────────────────────────────────────
 
     @contextmanager
     def session(self) -> Generator[Session, None, None]:
         """
-        Context manager para sesiones de BD.
-        Garantiza commit en éxito y rollback automático en excepción.
-        
+        Context manager que garantiza:
+          · commit() automático si el bloque termina sin excepción.
+          · rollback() automático si se lanza cualquier excepción.
+          · close() siempre, para liberar la conexión al pool.
+
         Uso:
             with db.session() as session:
                 session.add(objeto)
-                # commit automático al salir del with
+                # commit ocurre aquí automáticamente
         """
         sess = self._SessionFactory()
         try:
             yield sess
             sess.commit()
-        except SQLAlchemyError as e:
+        except SQLAlchemyError as exc:
             sess.rollback()
-            logger.error(f"Error en sesión BD, rollback ejecutado: {e}")
+            logger.error("Rollback ejecutado por error de BD: %s", exc)
             raise
         finally:
             sess.close()
 
-    # -----------------------------------------------------------------------
-    # ESCRITURA
-    # -----------------------------------------------------------------------
+    # ── ESCRITURA ─────────────────────────────────────────────────────────────
 
     def insertar_licitacion(
         self,
@@ -107,17 +108,18 @@ class DatabaseManager:
         schema: LicitacionSchema,
     ) -> tuple[bool, str]:
         """
-        Inserta una licitación si no existe (idempotente).
-        
+        Inserta una licitación nueva de forma idempotente.
+
+        Verifica existencia antes de insertar (más eficiente que capturar
+        IntegrityError) pero también maneja el caso de race condition.
+
         Returns:
-            (True, "INSERTADA") si es nueva
-            (False, "DUPLICADA") si ya existe en BD
-            (False, "ERROR") si falló la inserción
+            (True,  "INSERTADA")  → licitación nueva, guardada en BD.
+            (False, "DUPLICADA")  → ya existía, ignorada correctamente.
+            (False, "ERROR")      → fallo inesperado de BD.
         """
-        # Verificar existencia ANTES de intentar insertar (más eficiente que catch)
-        existe = session.get(Licitacion, schema.id)
-        if existe:
-            logger.debug(f"[DUPLICADA] {schema.id[:50]}")
+        if session.get(Licitacion, schema.id):
+            logger.debug("Duplicada (ya existe): %.60s", schema.id)
             return False, "DUPLICADA"
 
         try:
@@ -142,19 +144,20 @@ class DatabaseManager:
             )
             session.add(licitacion)
             logger.info(
-                f"[NUEVA] {schema.titulo[:70]} | "
-                f"Órgano: {schema.organo_contratacion or 'N/A'} | "
-                f"Presupuesto: {schema.presupuesto_base or 'N/A'}€"
+                "Nueva: %.65s | Órgano: %s | Presupuesto: %s€",
+                schema.titulo,
+                schema.organo_contratacion or "N/A",
+                schema.presupuesto_base or "N/A",
             )
             return True, "INSERTADA"
 
         except IntegrityError:
             session.rollback()
-            logger.warning(f"[RACE CONDITION] ID duplicado en inserción: {schema.id[:50]}")
+            logger.warning("Race condition en inserción: %.60s", schema.id)
             return False, "DUPLICADA"
-        except SQLAlchemyError as e:
+        except SQLAlchemyError as exc:
             session.rollback()
-            logger.error(f"[ERROR BD] Fallo insertando {schema.id[:50]}: {e}")
+            logger.error("Error de BD insertando %.60s: %s", schema.id, exc)
             return False, "ERROR"
 
     def actualizar_estado(
@@ -164,9 +167,9 @@ class DatabaseManager:
         nuevo_estado: str,
         error_msg: Optional[str] = None,
     ) -> bool:
-        """Actualiza el estado del ciclo de vida de una licitación."""
+        """Actualiza el estado del pipeline de una licitación concreta."""
         try:
-            stmt = (
+            result = session.execute(
                 update(Licitacion)
                 .where(Licitacion.id == licitacion_id)
                 .values(
@@ -175,14 +178,13 @@ class DatabaseManager:
                     error_msg=error_msg,
                 )
             )
-            result = session.execute(stmt)
             if result.rowcount == 0:
-                logger.warning(f"actualizar_estado: ID no encontrado {licitacion_id[:50]}")
+                logger.warning("actualizar_estado: ID no encontrado %.60s", licitacion_id)
                 return False
-            logger.debug(f"Estado actualizado → {nuevo_estado} para {licitacion_id[:50]}")
+            logger.debug("Estado → %s para %.50s", nuevo_estado, licitacion_id)
             return True
-        except SQLAlchemyError as e:
-            logger.error(f"Error actualizando estado: {e}")
+        except SQLAlchemyError as exc:
+            logger.error("Error actualizando estado: %s", exc)
             return False
 
     def guardar_urls_pdf(
@@ -192,7 +194,10 @@ class DatabaseManager:
         url_ppt: Optional[str] = None,
         url_pca: Optional[str] = None,
     ) -> bool:
-        """Persiste las URLs de los PDFs encontrados en el scraping de detalle."""
+        """
+        Persiste las URLs de PDFs encontradas por el scraper de detalle (Step 2).
+        Actualiza automáticamente el estado a PDF_PENDIENTE si hay al menos una URL.
+        """
         try:
             values: dict = {"updated_at": datetime.utcnow()}
             if url_ppt:
@@ -201,18 +206,15 @@ class DatabaseManager:
                 values["url_pdf_pca"] = url_pca
             if url_ppt or url_pca:
                 values["estado_proceso"] = config.EstadoLicitacion.PDF_PENDIENTE
-
             session.execute(
                 update(Licitacion).where(Licitacion.id == licitacion_id).values(**values)
             )
             return True
-        except SQLAlchemyError as e:
-            logger.error(f"Error guardando URLs PDF: {e}")
+        except SQLAlchemyError as exc:
+            logger.error("Error guardando URLs PDF: %s", exc)
             return False
 
-    # -----------------------------------------------------------------------
-    # LECTURA
-    # -----------------------------------------------------------------------
+    # ── LECTURA ───────────────────────────────────────────────────────────────
 
     def obtener_por_estado(
         self,
@@ -220,54 +222,56 @@ class DatabaseManager:
         estado: str,
         limite: int = 50,
     ) -> list[Licitacion]:
-        """Obtiene licitaciones filtradas por estado del pipeline."""
-        stmt = (
-            select(Licitacion)
-            .where(Licitacion.estado_proceso == estado)
-            .order_by(Licitacion.fecha_publicacion.desc())
-            .limit(limite)
+        """Devuelve licitaciones filtradas por estado, ordenadas por fecha desc."""
+        return list(
+            session.scalars(
+                select(Licitacion)
+                .where(Licitacion.estado_proceso == estado)
+                .order_by(Licitacion.fecha_publicacion.desc())
+                .limit(limite)
+            ).all()
         )
-        return list(session.scalars(stmt).all())
 
     def obtener_recientes(
         self,
         session: Session,
         limite: int = 20,
     ) -> list[Licitacion]:
-        """Obtiene las N licitaciones más recientes por fecha de publicación."""
-        stmt = (
-            select(Licitacion)
-            .order_by(Licitacion.fecha_publicacion.desc().nulls_last())
-            .limit(limite)
+        """Devuelve las N licitaciones más recientes por fecha de publicación."""
+        return list(
+            session.scalars(
+                select(Licitacion)
+                .order_by(Licitacion.fecha_publicacion.desc().nulls_last())
+                .limit(limite)
+            ).all()
         )
-        return list(session.scalars(stmt).all())
 
     def estadisticas(self, session: Session) -> dict:
         """
-        Retorna un resumen del estado actual de la BD.
-        Útil para dashboards y logs de ejecución.
+        Resumen del estado actual de la BD.
+        Devuelve: {'por_estado': {estado: count}, 'total': N, 'ultima_actualizacion': dt}
         """
-        stats = {}
         estados = session.execute(
             select(Licitacion.estado_proceso, func.count(Licitacion.id))
             .group_by(Licitacion.estado_proceso)
         ).all()
-        stats["por_estado"] = {estado: count for estado, count in estados}
-        stats["total"] = sum(stats["por_estado"].values())
-        stats["ultima_actualizacion"] = session.execute(
-            select(func.max(Licitacion.updated_at))
-        ).scalar()
-        return stats
+        por_estado = {e: c for e, c in estados}
+        return {
+            "por_estado": por_estado,
+            "total": sum(por_estado.values()),
+            "ultima_actualizacion": session.execute(
+                select(func.max(Licitacion.updated_at))
+            ).scalar(),
+        }
 
-    # -----------------------------------------------------------------------
-    # LOG DE EJECUCIONES
-    # -----------------------------------------------------------------------
+    # ── LOG DE EJECUCIONES ────────────────────────────────────────────────────
 
     def iniciar_log_ejecucion(self, session: Session, feed_url: str) -> LogEjecucion:
-        """Registra el inicio de un run. Retorna el objeto para actualización posterior."""
+        """Registra el inicio de un run. Hace flush para obtener el ID."""
         log = LogEjecucion(feed_url=feed_url, estado_run="EN_CURSO")
         session.add(log)
-        session.flush()  # Para obtener el ID antes del commit
+        session.flush()
+        logger.debug("Log de ejecución iniciado: id=%s", log.id)
         return log
 
     def finalizar_log_ejecucion(
@@ -281,7 +285,7 @@ class DatabaseManager:
         estado: str = "OK",
         mensaje: Optional[str] = None,
     ) -> None:
-        """Cierra el registro del run con estadísticas finales."""
+        """Cierra el registro del run con las métricas finales."""
         log.timestamp_fin = datetime.utcnow()
         log.total_entradas_feed = total_feed
         log.nuevas_insertadas = nuevas
@@ -290,3 +294,7 @@ class DatabaseManager:
         log.estado_run = estado
         log.mensaje = mensaje
         session.add(log)
+        logger.info(
+            "Log run #%s cerrado: estado=%s | nuevas=%d | duplicadas=%d | errores=%d",
+            log.id, estado, nuevas, duplicadas, errores,
+        )
