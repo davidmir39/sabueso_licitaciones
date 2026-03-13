@@ -3,15 +3,11 @@ src/db_manager.py — Sabueso de Licitaciones
 =============================================
 Única capa de acceso a la base de datos.
 
-Responsabilidades (y SOLO estas):
-  · Crear/verificar el schema al arrancar.
-  · Proveer un context manager de sesión con commit/rollback automático.
-  · CRUD de licitaciones y log de ejecuciones.
-
-Lo que NO hace este módulo:
-  · Parsear HTML o feeds (eso es utils.py / scraper_atom.py).
-  · Formatear output para consola (eso es main.py).
-  · Decidir qué licitaciones son relevantes (eso será ia_analyzer.py).
+CAMBIOS v2 (Step 2):
+  · insertar_licitacion guarda url_pdf_ppt y nombre_pdf desde el schema.
+  · Si url_pdf_directo está presente, el estado inicial es PDF_PENDIENTE
+    en lugar de NUEVA (ya tenemos la URL, solo falta descargar).
+  · Nuevo método: obtener_pendientes_pdf → licitaciones listas para descargar.
 """
 
 from __future__ import annotations
@@ -38,10 +34,6 @@ class DatabaseManager:
     """
     Gestor centralizado de la base de datos.
 
-    Diseñado para instanciarse una vez en main.py y reutilizarse
-    durante toda la ejecución (no es thread-safe por defecto con SQLite,
-    pero para este caso de uso single-process es suficiente).
-
     Uso:
         db = DatabaseManager()
         with db.session() as session:
@@ -66,28 +58,18 @@ class DatabaseManager:
         logger.info("DatabaseManager listo: %s", database_url)
 
     def _inicializar_schema(self) -> None:
-        """Crea tablas si no existen. Idempotente y seguro en cada arranque."""
         try:
             Base.metadata.create_all(self._engine)
-            logger.debug("Schema de BD verificado correctamente.")
+            logger.debug("Schema de BD verificado.")
         except SQLAlchemyError as exc:
-            logger.critical("Error fatal inicializando schema de BD: %s", exc)
+            logger.critical("Error inicializando schema: %s", exc)
             raise
-
-    # ── Context manager de sesión ─────────────────────────────────────────────
 
     @contextmanager
     def session(self) -> Generator[Session, None, None]:
         """
-        Context manager que garantiza:
-          · commit() automático si el bloque termina sin excepción.
-          · rollback() automático si se lanza cualquier excepción.
-          · close() siempre, para liberar la conexión al pool.
-
-        Uso:
-            with db.session() as session:
-                session.add(objeto)
-                # commit ocurre aquí automáticamente
+        Context manager con commit/rollback automático.
+        Garantiza que la conexión siempre se libera.
         """
         sess = self._SessionFactory()
         try:
@@ -95,7 +77,7 @@ class DatabaseManager:
             sess.commit()
         except SQLAlchemyError as exc:
             sess.rollback()
-            logger.error("Rollback ejecutado por error de BD: %s", exc)
+            logger.error("Rollback ejecutado: %s", exc)
             raise
         finally:
             sess.close()
@@ -108,19 +90,25 @@ class DatabaseManager:
         schema: LicitacionSchema,
     ) -> tuple[bool, str]:
         """
-        Inserta una licitación nueva de forma idempotente.
+        Inserta una licitación de forma idempotente.
 
-        Verifica existencia antes de insertar (más eficiente que capturar
-        IntegrityError) pero también maneja el caso de race condition.
+        Estado inicial:
+          · PDF_PENDIENTE si url_pdf_directo está presente en el feed
+          · NUEVA si no hay URL de PDF en el feed
 
         Returns:
-            (True,  "INSERTADA")  → licitación nueva, guardada en BD.
-            (False, "DUPLICADA")  → ya existía, ignorada correctamente.
-            (False, "ERROR")      → fallo inesperado de BD.
+            (True, "INSERTADA") | (False, "DUPLICADA") | (False, "ERROR")
         """
         if session.get(Licitacion, schema.id):
-            logger.debug("Duplicada (ya existe): %.60s", schema.id)
+            logger.debug("Duplicada: %.60s", schema.id)
             return False, "DUPLICADA"
+
+        # Determinamos el estado inicial según si el feed ya incluye la URL del PDF
+        estado_inicial = (
+            config.EstadoLicitacion.PDF_PENDIENTE
+            if schema.url_pdf_directo
+            else config.EstadoLicitacion.NUEVA
+        )
 
         try:
             licitacion = Licitacion(
@@ -139,12 +127,15 @@ class DatabaseManager:
                 lugar_ejecucion=schema.lugar_ejecucion,
                 estado_contrato=schema.estado_contrato,
                 expediente=schema.expediente,
+                url_pdf_ppt=schema.url_pdf_directo,   # URL directa del feed
+                nombre_pdf=schema.nombre_pdf,
                 raw_summary_html=schema.raw_summary_html,
-                estado_proceso=config.EstadoLicitacion.NUEVA,
+                estado_proceso=estado_inicial,
             )
             session.add(licitacion)
             logger.info(
-                "Nueva: %.65s | Órgano: %s | Presupuesto: %s€",
+                "[%s] %.65s | %s | %s€",
+                estado_inicial,
                 schema.titulo,
                 schema.organo_contratacion or "N/A",
                 schema.presupuesto_base or "N/A",
@@ -157,7 +148,7 @@ class DatabaseManager:
             return False, "DUPLICADA"
         except SQLAlchemyError as exc:
             session.rollback()
-            logger.error("Error de BD insertando %.60s: %s", schema.id, exc)
+            logger.error("Error BD insertando: %s", exc)
             return False, "ERROR"
 
     def actualizar_estado(
@@ -167,7 +158,7 @@ class DatabaseManager:
         nuevo_estado: str,
         error_msg: Optional[str] = None,
     ) -> bool:
-        """Actualiza el estado del pipeline de una licitación concreta."""
+        """Actualiza el estado del pipeline de una licitación."""
         try:
             result = session.execute(
                 update(Licitacion)
@@ -179,42 +170,62 @@ class DatabaseManager:
                 )
             )
             if result.rowcount == 0:
-                logger.warning("actualizar_estado: ID no encontrado %.60s", licitacion_id)
+                logger.warning("ID no encontrado para actualizar: %.60s", licitacion_id)
                 return False
-            logger.debug("Estado → %s para %.50s", nuevo_estado, licitacion_id)
             return True
         except SQLAlchemyError as exc:
             logger.error("Error actualizando estado: %s", exc)
             return False
 
-    def guardar_urls_pdf(
+    def marcar_pdf_descargado(
         self,
         session: Session,
         licitacion_id: str,
-        url_ppt: Optional[str] = None,
-        url_pca: Optional[str] = None,
+        ruta_local: str,
     ) -> bool:
         """
-        Persiste las URLs de PDFs encontradas por el scraper de detalle (Step 2).
-        Actualiza automáticamente el estado a PDF_PENDIENTE si hay al menos una URL.
+        Registra que el PDF se ha descargado correctamente.
+        Actualiza ruta_pdf_local y estado → PDF_DESCARGADO.
         """
         try:
-            values: dict = {"updated_at": datetime.utcnow()}
-            if url_ppt:
-                values["url_pdf_ppt"] = url_ppt
-            if url_pca:
-                values["url_pdf_pca"] = url_pca
-            if url_ppt or url_pca:
-                values["estado_proceso"] = config.EstadoLicitacion.PDF_PENDIENTE
             session.execute(
-                update(Licitacion).where(Licitacion.id == licitacion_id).values(**values)
+                update(Licitacion)
+                .where(Licitacion.id == licitacion_id)
+                .values(
+                    ruta_pdf_local=ruta_local,
+                    estado_proceso=config.EstadoLicitacion.PDF_DESCARGADO,
+                    updated_at=datetime.utcnow(),
+                    error_msg=None,
+                )
             )
+            logger.debug("PDF descargado registrado: %.50s → %s", licitacion_id, ruta_local)
             return True
         except SQLAlchemyError as exc:
-            logger.error("Error guardando URLs PDF: %s", exc)
+            logger.error("Error marcando PDF descargado: %s", exc)
             return False
 
     # ── LECTURA ───────────────────────────────────────────────────────────────
+
+    def obtener_pendientes_pdf(
+        self,
+        session: Session,
+        limite: int = 50,
+    ) -> list[Licitacion]:
+        """
+        Devuelve licitaciones en estado PDF_PENDIENTE que tienen URL de PDF.
+        Son las candidatas para la descarga en el Step 2.
+        """
+        return list(
+            session.scalars(
+                select(Licitacion)
+                .where(
+                    Licitacion.estado_proceso == config.EstadoLicitacion.PDF_PENDIENTE,
+                    Licitacion.url_pdf_ppt.is_not(None),
+                )
+                .order_by(Licitacion.fecha_publicacion.desc())
+                .limit(limite)
+            ).all()
+        )
 
     def obtener_por_estado(
         self,
@@ -222,7 +233,6 @@ class DatabaseManager:
         estado: str,
         limite: int = 50,
     ) -> list[Licitacion]:
-        """Devuelve licitaciones filtradas por estado, ordenadas por fecha desc."""
         return list(
             session.scalars(
                 select(Licitacion)
@@ -237,7 +247,6 @@ class DatabaseManager:
         session: Session,
         limite: int = 20,
     ) -> list[Licitacion]:
-        """Devuelve las N licitaciones más recientes por fecha de publicación."""
         return list(
             session.scalars(
                 select(Licitacion)
@@ -247,10 +256,6 @@ class DatabaseManager:
         )
 
     def estadisticas(self, session: Session) -> dict:
-        """
-        Resumen del estado actual de la BD.
-        Devuelve: {'por_estado': {estado: count}, 'total': N, 'ultima_actualizacion': dt}
-        """
         estados = session.execute(
             select(Licitacion.estado_proceso, func.count(Licitacion.id))
             .group_by(Licitacion.estado_proceso)
@@ -267,11 +272,9 @@ class DatabaseManager:
     # ── LOG DE EJECUCIONES ────────────────────────────────────────────────────
 
     def iniciar_log_ejecucion(self, session: Session, feed_url: str) -> LogEjecucion:
-        """Registra el inicio de un run. Hace flush para obtener el ID."""
         log = LogEjecucion(feed_url=feed_url, estado_run="EN_CURSO")
         session.add(log)
         session.flush()
-        logger.debug("Log de ejecución iniciado: id=%s", log.id)
         return log
 
     def finalizar_log_ejecucion(
@@ -285,7 +288,6 @@ class DatabaseManager:
         estado: str = "OK",
         mensaje: Optional[str] = None,
     ) -> None:
-        """Cierra el registro del run con las métricas finales."""
         log.timestamp_fin = datetime.utcnow()
         log.total_entradas_feed = total_feed
         log.nuevas_insertadas = nuevas
@@ -295,6 +297,6 @@ class DatabaseManager:
         log.mensaje = mensaje
         session.add(log)
         logger.info(
-            "Log run #%s cerrado: estado=%s | nuevas=%d | duplicadas=%d | errores=%d",
+            "Log run #%s cerrado: estado=%s | nuevas=%d | dupl=%d | err=%d",
             log.id, estado, nuevas, duplicadas, errores,
         )

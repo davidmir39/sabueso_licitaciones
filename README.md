@@ -92,3 +92,35 @@ python main.py --ping               # verifica conectividad con la PCSP
 | `DESCARTADA` | IA: no relevante |
 | `NOTIFICADA` | Enviada al cliente vía GPT-5 |
 | `ERROR` | Falló en algún paso |
+
+
+### El flujo completo de datos de principio a fin (hasta ahora)
+```
+PCSP (servidor remoto)
+      │
+      │  ATOM/XML con HTML embebido
+      ▼
+feedparser.parse(url)          ← tolera XML imperfecto
+      │
+      │  feed.entries[]  (lista cruda de feedparser)
+      ▼
+_parsear_entrada(entry)
+      │  limpiar_texto()        ← utils.py
+      │  parsear_fecha()        ← utils.py
+      │  parsear_summary_pcsp() ← utils.py (BeautifulSoup)
+      │
+      │  LicitacionSchema       ← dataclass limpio
+      ▼
+yield schema                   ← generador, uno a uno
+      │
+      ▼
+with db.session() as session:
+    db.insertar_licitacion(session, schema)
+      │  session.get() para comprobar duplicado
+      │  session.add(Licitacion(...))
+      │  commit automático al salir del with
+      │
+      ▼
+sabueso.db
+  tabla: licitaciones (estado=NUEVA)
+  tabla: log_ejecuciones (auditoría del run)

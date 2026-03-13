@@ -40,17 +40,12 @@ DATABASE_URL: str = os.getenv(
 # FEEDS ATOM — PCSP (Plataforma de Contratación del Sector Público)
 # ──────────────────────────────────────────────────────────────────────────────
 PCSP_FEEDS: dict[str, str] = {
-    # Todas las licitaciones con XML enriquecido
+    # Feed en vivo: actualización diaria, máximo 500 entradas por fichero
+    # Fuente oficial: hacienda.gob.es/GobiernoAbierto/Datos Abiertos
     "completo": os.getenv(
         "PCSP_FEED_COMPLETO",
-        "https://contrataciondelestado.es/sindicacion/sindicacion_1044/"
+        "https://contrataciondelsectorpublico.gob.es/sindicacion/sindicacion_643/"
         "licitacionesPerfilesContratanteCompleto3.atom",
-    ),
-    # Solo novedades: más ligero, ideal para polling frecuente
-    "novedades": os.getenv(
-        "PCSP_FEED_NOVEDADES",
-        "https://contrataciondelestado.es/sindicacion/sindicacion_1045/"
-        "licitacionesPerfilesContratante3.atom",
     ),
 }
 
