@@ -17,12 +17,9 @@ IMPORTANTE — estructura real del feed PCSP (verificada 05/03/2026):
 from __future__ import annotations
 
 import re
-import sys
 from datetime import datetime
-from pathlib import Path
 from typing import Optional
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
 from src.logger import get_logger
 
 logger = get_logger(__name__)

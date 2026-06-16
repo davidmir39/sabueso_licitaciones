@@ -3,6 +3,10 @@ src/db_manager.py — Sabueso de Licitaciones
 =============================================
 Única capa de acceso a la base de datos.
 
+CAMBIOS v3 (Fase 0 Paso 2):
+  · Reemplazado datetime.utcnow() (deprecated) por ahora_utc() de models.py.
+  · Eliminado el import de datetime (ya no se usa directamente aquí).
+
 CAMBIOS v2 (Step 2):
   · insertar_licitacion guarda url_pdf_ppt y nombre_pdf desde el schema.
   · Si url_pdf_directo está presente, el estado inicial es PDF_PENDIENTE
@@ -12,21 +16,19 @@ CAMBIOS v2 (Step 2):
 
 from __future__ import annotations
 
-import sys
 from contextlib import contextmanager
-from datetime import datetime
-from pathlib import Path
 from typing import Generator, Optional
 
 from sqlalchemy import create_engine, func, select, update
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
 import config
 from src.logger import get_logger
-from src.models import Base, Licitacion, LicitacionSchema, LogEjecucion
-
+from src.models import (
+           Base, Licitacion, LicitacionSchema, LogEjecucion, ahora_utc,
+           Cliente, PerfilInteres, MatchLicitacion,
+       )
 logger = get_logger(__name__)
 
 
@@ -165,7 +167,7 @@ class DatabaseManager:
                 .where(Licitacion.id == licitacion_id)
                 .values(
                     estado_proceso=nuevo_estado,
-                    updated_at=datetime.utcnow(),
+                    updated_at=ahora_utc(),   # Paso 2: reemplaza datetime.utcnow()
                     error_msg=error_msg,
                 )
             )
@@ -194,7 +196,7 @@ class DatabaseManager:
                 .values(
                     ruta_pdf_local=ruta_local,
                     estado_proceso=config.EstadoLicitacion.PDF_DESCARGADO,
-                    updated_at=datetime.utcnow(),
+                    updated_at=ahora_utc(),   # Paso 2: reemplaza datetime.utcnow()
                     error_msg=None,
                 )
             )
@@ -204,6 +206,176 @@ class DatabaseManager:
             logger.error("Error marcando PDF descargado: %s", exc)
             return False
 
+    
+
+    # ── MÉTODO 1: obtener PDFs listos para extraer texto ─────────────────────────
+
+    def obtener_pendientes_extraccion(
+        self,
+        session: Session,
+        limite: int = 50,
+    ) -> list[Licitacion]:
+        """
+        Devuelve licitaciones en estado PDF_DESCARGADO que tienen ruta_pdf_local.
+        Son las candidatas para el Step 3 (extracción de texto).
+        """
+        return list(
+            session.scalars(
+                select(Licitacion)
+                .where(
+                    Licitacion.estado_proceso == config.EstadoLicitacion.PDF_DESCARGADO,
+                    Licitacion.ruta_pdf_local.is_not(None),
+                )
+                .order_by(Licitacion.fecha_publicacion.desc())
+                .limit(limite)
+            ).all()
+        )
+# ── MÉTODO 2: guardar texto extraído y avanzar estado ────────────────────────
+
+    def marcar_texto_extraido(
+        self,
+        session: Session,
+        licitacion_id: str,
+        texto: str,
+    ) -> bool:
+        """
+        Guarda el texto extraído del PDF y avanza el estado a ANALISIS_PENDIENTE.
+
+        ANALISIS_PENDIENTE significa: "tenemos el texto, falta que la IA
+        lo analice para decidir si es relevante".
+        """
+        try:
+            session.execute(
+                update(Licitacion)
+                .where(Licitacion.id == licitacion_id)
+                .values(
+                    texto_extraido=texto,
+                    estado_proceso=config.EstadoLicitacion.ANALISIS_PENDIENTE,
+                    updated_at=ahora_utc(),
+                    error_msg=None,
+                )
+            )
+            logger.debug(
+                "Texto extraído guardado: %.50s → %d chars",
+                licitacion_id,
+                len(texto),
+            )
+            return True
+        except SQLAlchemyError as exc:
+            logger.error("Error guardando texto extraído: %s", exc)
+            return False
+
+    # ── MÉTODOS NUEVOS FASE 1C ────────────────────────────────────────────────
+
+    def obtener_pendientes_analisis(
+        self,
+        session: Session,
+        limite: int = 50,
+    ) -> list[Licitacion]:
+        """
+        Devuelve licitaciones en estado ANALISIS_PENDIENTE.
+        Son las que ya tienen texto extraído y esperan ser analizadas por la IA.
+        """
+        return list(
+            session.scalars(
+                select(Licitacion)
+                .where(
+                    Licitacion.estado_proceso == config.EstadoLicitacion.ANALISIS_PENDIENTE,
+                    Licitacion.texto_extraido.is_not(None),
+                )
+                .order_by(Licitacion.fecha_publicacion.desc())
+                .limit(limite)
+            ).all()
+        )
+
+    def obtener_perfiles_activos(self, session: Session) -> list[PerfilInteres]:
+        """
+        Devuelve todos los perfiles activos de clientes activos.
+        Solo estos perfiles participan en el análisis de relevancia.
+        """
+        return list(
+            session.scalars(
+                select(PerfilInteres)
+                .join(Cliente, PerfilInteres.cliente_id == Cliente.id)
+                .where(
+                    PerfilInteres.activo == True,
+                    Cliente.activo == True,
+                )
+            ).all()
+        )
+
+    def guardar_match(
+        self,
+        session: Session,
+        licitacion_id: str,
+        perfil_id: int,
+        paso_filtro_a: bool,
+        score_ia: Optional[int],
+        razon_ia: Optional[str],
+    ) -> bool:
+        """
+        Guarda el resultado del análisis de una licitación para un perfil.
+
+        Es idempotente: si el match ya existe (de una ejecución anterior),
+        no lo duplica (la BD tiene un índice UNIQUE sobre licitacion+perfil).
+
+        Returns:
+            True si se guardó correctamente, False si hubo error.
+        """
+        try:
+            # Usamos INSERT OR IGNORE equivalente: intentamos insertar
+            # y si ya existe el par (licitacion_id, perfil_id), ignoramos.
+            # En SQLAlchemy esto se hace comprobando antes.
+            from sqlalchemy import and_
+            existente = session.scalar(
+                select(MatchLicitacion).where(
+                    and_(
+                        MatchLicitacion.licitacion_id == licitacion_id,
+                        MatchLicitacion.perfil_id == perfil_id,
+                    )
+                )
+            )
+
+            if existente:
+                logger.debug(
+                    "Match ya existe: licitacion=%.40s perfil=%d",
+                    licitacion_id, perfil_id,
+                )
+                return True
+
+            match = MatchLicitacion(
+                licitacion_id=licitacion_id,
+                perfil_id=perfil_id,
+                paso_filtro_a=paso_filtro_a,
+                score_ia=score_ia,
+                razon_ia=razon_ia,
+                notificado=False,
+            )
+            session.add(match)
+            return True
+
+        except SQLAlchemyError as exc:
+            logger.error("Error guardando match: %s", exc)
+            return False
+
+    def marcar_licitacion_analizada(
+        self,
+        session: Session,
+        licitacion_id: str,
+        es_relevante: bool,
+    ) -> bool:
+        """
+        Actualiza el estado final de la licitación tras el análisis.
+
+        Si algún perfil la encontró relevante → RELEVANTE
+        Si ningún perfil la encontró relevante → DESCARTADA
+        """
+        nuevo_estado = (
+            config.EstadoLicitacion.RELEVANTE
+            if es_relevante
+            else config.EstadoLicitacion.DESCARTADA
+        )
+        return self.actualizar_estado(session, licitacion_id, nuevo_estado)
     # ── LECTURA ───────────────────────────────────────────────────────────────
 
     def obtener_pendientes_pdf(
@@ -288,7 +460,7 @@ class DatabaseManager:
         estado: str = "OK",
         mensaje: Optional[str] = None,
     ) -> None:
-        log.timestamp_fin = datetime.utcnow()
+        log.timestamp_fin = ahora_utc()   # Paso 2: reemplaza datetime.utcnow()
         log.total_entradas_feed = total_feed
         log.nuevas_insertadas = nuevas
         log.ya_existian = duplicadas

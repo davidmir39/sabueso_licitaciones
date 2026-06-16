@@ -17,7 +17,8 @@ from __future__ import annotations
 import logging
 import logging.handlers
 import sys
-from pathlib import Path
+
+import config
 
 _LOG_CONFIGURED: set[str] = set()
 
@@ -35,12 +36,7 @@ def get_logger(name: str) -> logging.Logger:
     if name in _LOG_CONFIGURED:
         return logger
 
-    # Importamos config dentro de la función para evitar importación circular
-    _root = Path(__file__).resolve().parents[1]
-    sys.path.insert(0, str(_root))
-    import config as _cfg
-
-    level = getattr(logging, _cfg.LOG_LEVEL, logging.INFO)
+    level = getattr(logging, config.LOG_LEVEL, logging.INFO)
     logger.setLevel(level)
 
     fmt = logging.Formatter(
@@ -56,9 +52,9 @@ def get_logger(name: str) -> logging.Logger:
 
     # — Fichero rotativo —
     fh = logging.handlers.RotatingFileHandler(
-        filename=_cfg.LOG_DIR / "sabueso.log",
-        maxBytes=_cfg.LOG_MAX_BYTES,
-        backupCount=_cfg.LOG_BACKUP_COUNT,
+        filename=config.LOG_DIR / "sabueso.log",
+        maxBytes=config.LOG_MAX_BYTES,
+        backupCount=config.LOG_BACKUP_COUNT,
         encoding="utf-8",
     )
     fh.setFormatter(fmt)

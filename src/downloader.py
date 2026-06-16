@@ -17,7 +17,6 @@ Lo que NO hace este módulo:
 
 from __future__ import annotations
 
-import sys
 import time
 from pathlib import Path
 from typing import Optional
@@ -26,7 +25,6 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
 import config
 from src.logger import get_logger
 from src.utils import generar_nombre_pdf

@@ -1,0 +1,75 @@
+# pyproject.toml — Sabueso de Licitaciones
+# ============================================
+# Este fichero declara que el proyecto es un paquete Python instalable.
+# Una vez ejecutes `pip install -e .` desde la raíz del proyecto, podrás
+# hacer `import config` y `from src.logger import get_logger` desde
+# cualquier sitio, sin los feos sys.path.insert.
+#
+# El flag `-e` significa "editable": los cambios que hagas en los .py se
+# reflejan inmediatamente sin reinstalar.
+
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sabueso-licitaciones"
+version = "0.1.0"
+description = "Monitorización de licitaciones públicas (PCSP) para pymes"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [
+    { name = "Tu Nombre", email = "tu@email.com" },
+]
+license = { text = "Proprietary" }
+
+# Dependencias de producción (las que ya tenías)
+dependencies = [
+    "feedparser==6.0.11",
+    "beautifulsoup4==4.12.3",
+    "lxml==5.2.1",
+    "sqlalchemy==2.0.30",
+    "requests==2.32.3",
+    "tenacity==8.4.1",
+    "python-dateutil==2.9.0",
+    "python-dotenv==1.0.1",
+    "rich==13.7.1",
+]
+
+# Dependencias opcionales agrupadas en "extras". Se instalan con:
+#   pip install -e ".[dev]"
+# o para los futuros steps:
+#   pip install -e ".[ia]"
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "alembic>=1.13",
+]
+# Lo que usaremos en Steps 3-5 (instalar cuando llegue el momento)
+ia = [
+    "pymupdf>=1.24",
+    "google-genai>=0.3",
+]
+
+# Registra un comando CLI. Después de instalar, podrás ejecutar:
+#   sabueso --stats
+# en lugar de:
+#   python main.py --stats
+[project.scripts]
+sabueso = "main:main"
+
+# ─── CONFIGURACIÓN DE EMPAQUETADO ────────────────────────────────────────────
+# Le decimos a setuptools qué código empaquetar.
+
+[tool.setuptools]
+# Ficheros Python sueltos en la raíz del proyecto
+py-modules = ["config", "main"]
+# Paquetes (carpetas con __init__.py)
+packages = ["src"]
+
+# ─── CONFIGURACIÓN DE PYTEST ─────────────────────────────────────────────────
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-v --tb=short"

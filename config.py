@@ -90,3 +90,19 @@ class EstadoLicitacion:
     DESCARTADA          = "DESCARTADA"           # IA: no relevante
     NOTIFICADA          = "NOTIFICADA"           # Enviada al cliente (GPT-5)
     ERROR               = "ERROR"               # Falló algún paso
+# ──────────────────────────────────────────────────────────────────────────────
+# IA — GEMINI
+# ──────────────────────────────────────────────────────────────────────────────
+GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
+GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite-preview-06-17")
+
+# Mínimo de caracteres para considerar que un PDF tiene texto útil.
+# Si PyMuPDF extrae menos que esto, asumimos que es un escaneado y
+# llamamos a Gemini para hacer OCR.
+TEXTO_MINIMO_CARACTERES: int = int(os.getenv("TEXTO_MINIMO_CARACTERES", "100"))
+# ──────────────────────────────────────────────────────────────────────────────
+# MOTOR DE RELEVANCIA
+# ──────────────────────────────────────────────────────────────────────────────
+# Puntuación mínima (0-100) para considerar una licitación relevante.
+# Por debajo de este número → DESCARTADA. Por encima → RELEVANTE.
+SCORE_RELEVANCIA_MINIMO: int = int(os.getenv("SCORE_RELEVANCIA_MINIMO", "60"))
