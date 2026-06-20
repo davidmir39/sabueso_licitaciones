@@ -9,9 +9,13 @@ sabueso_licitaciones.egg-info/entry_points.txt
 sabueso_licitaciones.egg-info/requires.txt
 sabueso_licitaciones.egg-info/top_level.txt
 src/__init__.py
+src/analizador.py
 src/db_manager.py
 src/downloader.py
+src/extractor.py
+src/ia_client.py
 src/logger.py
 src/models.py
 src/scraper_atom.py
 src/utils.py
+tests/test_utils.py
