@@ -36,7 +36,7 @@ from rich.table import Table
 import config
 from src.logger import get_logger
 from src.db_manager import DatabaseManager
-from src.scraper_atom import AtomScraper, PCPSFeedError
+from src.scraper_atom import AtomScraper, PCPSFeedError, _esta_cerrada
 from src.downloader import PDFDownloader
 from src.utils import formatear_presupuesto
 
@@ -134,12 +134,17 @@ def ejecutar_ingesta(feed_key: str, limite: int, dry_run: bool, db: DatabaseMana
                 logger.info("[DRY-RUN] %s | %s€", schema.titulo[:60], schema.presupuesto_base or "N/A")
                 resultados["nuevas"] += 1
                 continue
+            # si la licitación ya está cerrada, la insertamos
+            # directamente como DESCARTADA, sin gastar Steps 2-4 en ella.
+            estado_forzado = None
+            if _esta_cerrada(schema.estado_contrato):
+                estado_forzado = config.EstadoLicitacion.DESCARTADA
+
             with db.session() as session:
-                _, resultado = db.insertar_licitacion(session, schema)
+                _, resultado = db.insertar_licitacion(session, schema, estado_forzado)
             if resultado == "INSERTADA":     resultados["nuevas"] += 1
             elif resultado == "DUPLICADA":   resultados["duplicadas"] += 1
             else:                            resultados["errores"] += 1
-
     except PCPSFeedError as exc:
         logger.critical("Error crítico del feed: %s", exc)
         resultados["errores"] += 1

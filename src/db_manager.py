@@ -90,6 +90,7 @@ class DatabaseManager:
         self,
         session: Session,
         schema: LicitacionSchema,
+        estado_forzado: Optional[str] = None,
     ) -> tuple[bool, str]:
         """
         Inserta una licitación de forma idempotente.
@@ -105,12 +106,17 @@ class DatabaseManager:
             logger.debug("Duplicada: %.60s", schema.id)
             return False, "DUPLICADA"
 
-        # Determinamos el estado inicial según si el feed ya incluye la URL del PDF
-        estado_inicial = (
-            config.EstadoLicitacion.PDF_PENDIENTE
-            if schema.url_pdf_directo
-            else config.EstadoLicitacion.NUEVA
-        )
+        # Determinamos el estado inicial.
+        # Si nos fuerzan un estado (ej: Tarea 0 → licitación ya cerrada),
+        # lo respetamos. Si no, decidimos según si el feed incluye la URL del PDF.
+        if estado_forzado:
+            estado_inicial = estado_forzado
+        else:
+            estado_inicial = (
+                config.EstadoLicitacion.PDF_PENDIENTE
+                if schema.url_pdf_directo
+                else config.EstadoLicitacion.NUEVA
+            )
 
         try:
             licitacion = Licitacion(

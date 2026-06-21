@@ -44,6 +44,22 @@ from src.utils import (
 
 logger = get_logger(__name__)
 
+# Estados del contrato en el feed PCSP que indican que la licitación
+# ya está cerrada y no tiene sentido procesarla (gastaríamos Steps 2-4
+# en algo que el cliente no puede presentar).
+_ESTADOS_CERRADOS = {"ADJ", "FOR", "RES", "ANU"}
+
+
+def _esta_cerrada(estado_contrato: Optional[str]) -> bool:
+    """
+    Devuelve True si el estado del contrato indica que ya está cerrada.
+
+    En caso de duda (None o valor desconocido) devuelve False:
+    preferimos procesar de más que perder una licitación activa.
+    """
+    if not estado_contrato:
+        return False
+    return estado_contrato.strip().upper() in _ESTADOS_CERRADOS
 
 class PCPSFeedError(Exception):
     """Error específico del feed PCSP."""
@@ -251,6 +267,13 @@ class AtomScraper:
             # — Nombre descriptivo del PDF (campo UBL cbc_filename) —
             nombre_pdf = limpiar_texto(entry.get("cbc_filename"))
 
+            # — Detección de licitación ya cerrada —
+            # Si el estado indica cierre, marcamos el schema para que main.py
+            # lo inserte directamente como DESCARTADA sin gastar Steps 2-4.
+            estado_detectado = campos_summary.get("estado_contrato")
+            if _esta_cerrada(estado_detectado):
+                logger.debug("Licitación cerrada (%s), se insertará como DESCARTADA: %s", estado_detectado, titulo[:60])
+
             return LicitacionSchema(
                 id=entry_id,
                 titulo=titulo,
@@ -288,10 +311,13 @@ class AtomScraper:
         if limite and len(feed.entries) > limite:
             logger.info("Limitando a %d de %d entradas.", limite, len(feed.entries))
 
-        validas = errores = 0
+        validas = errores = cerradas = 0
         for i, entry in enumerate(entradas, start=1):
             schema = self._parsear_entrada(entry)
             if schema:
+                # Contamos aparte las cerradas para visibilidad en logs
+                if _esta_cerrada(schema.estado_contrato):
+                    cerradas += 1
                 validas += 1
                 yield schema
             else:
@@ -299,7 +325,7 @@ class AtomScraper:
             if i < len(entradas) and self.delay > 0:
                 time.sleep(self.delay)
 
-        logger.info("Parseo completado: %d válidas | %d errores.", validas, errores)
+        logger.info("Parseo completado: %d válidas (%d ya cerradas) | %d errores.", validas, cerradas, errores)
 
     def obtener_metadata_feed(self) -> dict:
         """Metadatos del feed sin procesar entradas. Para --ping."""
