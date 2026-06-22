@@ -1,0 +1,20 @@
+# Entorno virtual
+.venv/
+
+# Archivos compilados de Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Datos y archivos pesados
+data/pdfs/
+database/
+logs/
+
+# Caché de herramientas
+.pytest_cache/
+
+# Alembic compilado (las migraciones .py sí se incluyen, solo el __pycache__)
+alembic/versions/__pycache__/
+alembic/__pycache__/
