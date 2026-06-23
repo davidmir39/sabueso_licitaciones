@@ -177,4 +177,7 @@ def analizar_licitacion_para_perfil(
         "score_ia": resultado_ia["score"],
         "razon_ia": resultado_ia["razon"],
         "es_relevante": resultado_ia["es_relevante"],
+        # Propagamos el fallo técnico si lo hubo, para que main.py decida
+        # si reintentar (ANALISIS_PENDIENTE) en vez de descartar.
+        "fallo_tecnico": resultado_ia.get("fallo_tecnico", False),
     }

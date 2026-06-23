@@ -289,6 +289,7 @@ def ejecutar_analisis(limite: int, dry_run: bool, db: DatabaseManager) -> dict:
     for licit in pendientes:
         # Para esta licitación, la analizamos contra cada perfil
         alguno_relevante = False
+        hubo_fallo_tecnico = False   # ¿algún perfil no se pudo evaluar por fallo de IA?
 
         for perfil in perfiles:
             try:
@@ -308,10 +309,18 @@ def ejecutar_analisis(limite: int, dry_run: bool, db: DatabaseManager) -> dict:
                 if resultado["es_relevante"]:
                     alguno_relevante = True
                     logger.info(
-                        "⭐ RELEVANTE score=%d para '%s': %.50s",
+                        "RELEVANTE score=%d para '%s': %.50s",
                         resultado["score_ia"] or 0,
                         perfil.nombre,
                         licit.titulo,
+                    )
+
+                # Si este perfil no se pudo evaluar por un fallo de IA, lo anotamos.
+                if resultado.get("fallo_tecnico", False):
+                    hubo_fallo_tecnico = True
+                    logger.warning(
+                        "Fallo técnico de IA para '%s': %.50s → se reintentará",
+                        perfil.nombre, licit.titulo,
                     )
 
             except Exception as exc:
@@ -320,15 +329,25 @@ def ejecutar_analisis(limite: int, dry_run: bool, db: DatabaseManager) -> dict:
                     licit.titulo, perfil.nombre, exc,
                 )
 
-        # Actualizamos el estado final de la licitación
+        # Actualizamos el estado final de la licitación.
+        # Tres casos posibles (la relevancia tiene prioridad sobre el fallo):
+        #   1. Algún perfil la marcó relevante → RELEVANTE
+        #   2. No relevante, pero hubo fallo técnico → vuelve a ANALISIS_PENDIENTE
+        #      (no la descartamos por un fallo de infraestructura, se reintentará)
+        #   3. No relevante y sin fallos → DESCARTADA (descarte legítimo)
         with db.session() as session:
-            db.marcar_licitacion_analizada(session, licit.id, alguno_relevante)
-
-        if alguno_relevante:
-            stats["relevantes"] += 1
-        else:
-            stats["descartadas"] += 1
-
+            if alguno_relevante:
+                db.marcar_licitacion_analizada(session, licit.id, True)
+                stats["relevantes"] += 1
+            elif hubo_fallo_tecnico:
+                db.actualizar_estado(
+                    session, licit.id,
+                    config.EstadoLicitacion.ANALISIS_PENDIENTE,
+                )
+                stats["errores"] += 1
+            else:
+                db.marcar_licitacion_analizada(session, licit.id, False)
+                stats["descartadas"] += 1
     stats["duracion_seg"] = round(time.monotonic() - inicio, 2)
     logger.info(
         "Análisis completado: %d relevantes | %d descartadas",

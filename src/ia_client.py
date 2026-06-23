@@ -192,6 +192,7 @@ Donde:
             "score": score,
             "razon": razon,
             "es_relevante": es_relevante,
+            "fallo_tecnico": False,
         }
 
     except json.JSONDecodeError as exc:
@@ -199,9 +200,14 @@ Donde:
             "Gemini no devolvió JSON válido para '%.40s': %s | Respuesta: %s",
             titulo, exc, texto_respuesta[:200],
         )
-        # Devolvemos score 0 para no bloquear el pipeline
-        return {"score": 0, "razon": "Error al parsear respuesta de IA", "es_relevante": False}
+        # Gemini SÍ respondió, pero no en JSON. Por ahora lo tratamos como
+        # descarte (no reintentamos). Si en el futuro vemos que se pierden
+        # licitaciones por esto, migraremos a un sistema de reintentos con tope.
+        return {"score": 0, "razon": "Error al parsear respuesta de IA", "es_relevante": False, "fallo_tecnico": False}
 
     except Exception as exc:
         logger.error("Error analizando relevancia para '%.40s': %s", titulo, exc)
-        return {"score": 0, "razon": f"Error: {exc}", "es_relevante": False}
+        # FALLO TÉCNICO: Gemini no respondió (sin crédito, 429, modelo deprecado,
+        # red caída, timeout...). La licitación NO se ha evaluado de verdad, así
+        # que NO debe descartarse: marcamos fallo_tecnico para reintentarla luego.
+        return {"score": 0, "razon": f"Error técnico: {exc}", "es_relevante": False, "fallo_tecnico": True}
