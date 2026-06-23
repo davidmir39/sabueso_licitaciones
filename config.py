@@ -106,3 +106,19 @@ TEXTO_MINIMO_CARACTERES: int = int(os.getenv("TEXTO_MINIMO_CARACTERES", "100"))
 # Puntuación mínima (0-100) para considerar una licitación relevante.
 # Por debajo de este número → DESCARTADA. Por encima → RELEVANTE.
 SCORE_RELEVANCIA_MINIMO: int = int(os.getenv("SCORE_RELEVANCIA_MINIMO", "60"))
+# ──────────────────────────────────────────────────────────────────────────────
+# NOTIFICACIONES — EMAIL (Resend)
+# ──────────────────────────────────────────────────────────────────────────────
+# Clave de API de Resend (se lee del .env, nunca se escribe en el código).
+RESEND_API_KEY: str = os.getenv("RESEND_API_KEY", "")
+
+# Remitente de los emails. Durante el desarrollo usamos el dominio de pruebas
+# de Resend (onboarding@resend.dev), que solo puede enviar a tu propio correo.
+# En producción se cambia por tu dominio verificado: "avisos@tudominio.es".
+EMAIL_FROM: str = os.getenv("EMAIL_FROM", "Sabueso <onboarding@resend.dev>")
+
+# Interruptor general de notificaciones. Si es False, el Step 5 no envía
+# nada (útil para probar el pipeline sin gastar emails). Se activa en .env.
+EMAIL_NOTIFICACIONES_ACTIVO: bool = (
+    os.getenv("EMAIL_NOTIFICACIONES_ACTIVO", "true").lower() == "true"
+)
