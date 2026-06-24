@@ -382,8 +382,70 @@ class DatabaseManager:
             else config.EstadoLicitacion.DESCARTADA
         )
         return self.actualizar_estado(session, licitacion_id, nuevo_estado)
-    # ── LECTURA ───────────────────────────────────────────────────────────────
+    
 
+    def obtener_matches_para_notificar(
+        self,
+        session: Session,
+        limite: int = 50,
+    ) -> list[dict]:
+        """
+        Devuelve los matches relevantes que aún no se han notificado.
+
+        Un match entra en la lista si cumple TODO esto:
+          · score_ia >= umbral de relevancia (es interesante)
+          · notificado == False (aún no se ha avisado al cliente)
+          · el perfil y el cliente están activos
+
+        Devuelve DICCIONARIOS PLANOS (no objetos ORM) con los datos que el
+        email necesita. Lo hacemos así para extraer todo dentro de la sesión
+        y evitar errores de "lazy loading" al acceder a las relaciones
+        (match.perfil.cliente) una vez cerrada la sesión.
+
+        Returns:
+            Lista de dicts con: match_id, email_cliente, nombre_cliente,
+            nombre_perfil, titulo, organo, presupuesto, link, score, razon.
+        """
+        # Recorremos matches uniéndolos con perfil y cliente para filtrar
+        # por actividad y umbral en una sola consulta.
+        matches = session.scalars(
+            select(MatchLicitacion)
+            .join(PerfilInteres, MatchLicitacion.perfil_id == PerfilInteres.id)
+            .join(Cliente, PerfilInteres.cliente_id == Cliente.id)
+            .where(
+                MatchLicitacion.notificado == False,
+                MatchLicitacion.score_ia.is_not(None),
+                MatchLicitacion.score_ia >= config.SCORE_RELEVANCIA_MINIMO,
+                PerfilInteres.activo == True,
+                Cliente.activo == True,
+            )
+            .order_by(MatchLicitacion.score_ia.desc())
+            .limit(limite)
+        ).all()
+
+        # Extraemos los datos a diccionarios planos DENTRO de la sesión.
+        # Aquí sí podemos acceder a las relaciones (match.perfil, match.licitacion)
+        # porque la sesión está abierta.
+        resultado = []
+        for match in matches:
+            licitacion = match.licitacion
+            cliente = match.perfil.cliente
+            resultado.append({
+                "match_id": match.id,
+                "email_cliente": cliente.email,
+                "nombre_cliente": cliente.nombre,
+                "nombre_perfil": match.perfil.nombre,
+                "titulo": licitacion.titulo,
+                "organo": licitacion.organo_contratacion,
+                "presupuesto": licitacion.presupuesto_base,
+                "link": licitacion.link_plataforma,
+                "score": match.score_ia,
+                "razon": match.razon_ia,
+            })
+
+        return resultado
+
+    # ── LECTURA ───────────────────────────────────────────────────────────────
     def obtener_pendientes_pdf(
         self,
         session: Session,
