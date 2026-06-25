@@ -444,6 +444,35 @@ class DatabaseManager:
             })
 
         return resultado
+    
+    def marcar_match_notificado(
+        self,
+        session: Session,
+        match_id: int,
+    ) -> bool:
+        """
+        Marca un match como notificado tras enviar el email con éxito.
+
+        Pone notificado=True y registra la fecha. Esto da idempotencia:
+        en la próxima ejecución, obtener_matches_para_notificar() ya no
+        lo devolverá, así que no se reenvía el mismo aviso.
+        """
+        try:
+            result = session.execute(
+                update(MatchLicitacion)
+                .where(MatchLicitacion.id == match_id)
+                .values(
+                    notificado=True,
+                    notificado_at=ahora_utc(),
+                )
+            )
+            if result.rowcount == 0:
+                logger.warning("Match no encontrado para marcar notificado: %d", match_id)
+                return False
+            return True
+        except SQLAlchemyError as exc:
+            logger.error("Error marcando match notificado: %s", exc)
+            return False
 
     # ── LECTURA ───────────────────────────────────────────────────────────────
     def obtener_pendientes_pdf(

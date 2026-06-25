@@ -17,6 +17,8 @@ from typing import Optional
 
 import config
 from src.logger import get_logger
+from src.utils import formatear_presupuesto
+
 
 logger = get_logger(__name__)
 
@@ -45,6 +47,88 @@ def _get_cliente_resend():
     # Resend se configura asignando la key a una variable del módulo.
     resend.api_key = config.RESEND_API_KEY
     return resend
+
+
+def construir_email_licitacion(datos: dict) -> tuple[str, str]:
+    """
+    Construye el asunto y el cuerpo HTML de un email de notificación.
+
+    Recibe uno de los diccionarios que devuelve
+    db.obtener_matches_para_notificar(), con los datos ya planos.
+
+    Args:
+        datos: dict con titulo, organo, presupuesto, link, score, razon,
+               nombre_cliente, nombre_perfil.
+
+    Returns:
+        (asunto, cuerpo_html) listos para pasar a enviar_email().
+    """
+    # — Asunto: corto y con el dato más llamativo (el título recortado) —
+    titulo = datos.get("titulo") or "Licitación sin título"
+    asunto = f"🐕 Nueva licitación relevante: {titulo[:60]}"
+
+    # — Preparamos los valores, manejando los que pueden faltar —
+    organo = datos.get("organo") or "No especificado"
+    presupuesto_str = formatear_presupuesto(datos.get("presupuesto"))
+    score = datos.get("score")
+    score_str = f"{score}/100" if score is not None else "N/D"
+    razon = datos.get("razon") or "Sin explicación disponible"
+    link = datos.get("link")
+    nombre_cliente = datos.get("nombre_cliente") or "cliente"
+    nombre_perfil = datos.get("nombre_perfil") or ""
+
+    # — Bloque del enlace: solo lo mostramos si existe —
+    if link:
+        bloque_link = (
+            f'<p style="margin-top:20px;">'
+            f'<a href="{link}" '
+            f'style="background:#1a73e8;color:#fff;padding:10px 18px;'
+            f'text-decoration:none;border-radius:5px;">'
+            f'Ver licitación en la plataforma</a></p>'
+        )
+    else:
+        bloque_link = ""
+
+    # — Cuerpo HTML: tabla sencilla, sin CSS complejo (mejor entregabilidad) —
+    cuerpo_html = f"""
+    <div style="font-family:Arial,sans-serif;max-width:600px;color:#333;">
+        <h2 style="color:#1a73e8;">Nueva licitación para ti</h2>
+        <p>Hola {nombre_cliente},</p>
+        <p>Hemos encontrado una licitación que encaja con tu perfil
+           <strong>{nombre_perfil}</strong>:</p>
+
+        <table style="width:100%;border-collapse:collapse;margin-top:15px;">
+            <tr>
+                <td style="padding:8px;border-bottom:1px solid #eee;font-weight:bold;width:140px;">Título</td>
+                <td style="padding:8px;border-bottom:1px solid #eee;">{titulo}</td>
+            </tr>
+            <tr>
+                <td style="padding:8px;border-bottom:1px solid #eee;font-weight:bold;">Órgano</td>
+                <td style="padding:8px;border-bottom:1px solid #eee;">{organo}</td>
+            </tr>
+            <tr>
+                <td style="padding:8px;border-bottom:1px solid #eee;font-weight:bold;">Presupuesto</td>
+                <td style="padding:8px;border-bottom:1px solid #eee;">{presupuesto_str}</td>
+            </tr>
+            <tr>
+                <td style="padding:8px;border-bottom:1px solid #eee;font-weight:bold;">Relevancia IA</td>
+                <td style="padding:8px;border-bottom:1px solid #eee;">{score_str}</td>
+            </tr>
+            <tr>
+                <td style="padding:8px;border-bottom:1px solid #eee;font-weight:bold;">Por qué</td>
+                <td style="padding:8px;border-bottom:1px solid #eee;">{razon}</td>
+            </tr>
+        </table>
+
+        {bloque_link}
+
+        <p style="margin-top:25px;font-size:12px;color:#999;">
+            Sabueso de Licitaciones · Notificación automática
+        </p>
+    </div>
+    """
+
+    return asunto, cuerpo_html
 
 
 def enviar_email(
