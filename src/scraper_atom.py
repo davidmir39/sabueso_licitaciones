@@ -47,7 +47,7 @@ logger = get_logger(__name__)
 # Estados del contrato en el feed PCSP que indican que la licitación
 # ya está cerrada y no tiene sentido procesarla (gastaríamos Steps 2-4
 # en algo que el cliente no puede presentar).
-_ESTADOS_CERRADOS = {"ADJ", "FOR", "RES", "ANU"}
+_ESTADOS_CERRADOS = {"ADJ", "FOR", "RES", "ANU", "EV"}
 
 
 def _esta_cerrada(estado_contrato: Optional[str]) -> bool:

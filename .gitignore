@@ -10,3 +10,4 @@ venv/
 .env
 .env.local
 roadmap.md
+query.sql
