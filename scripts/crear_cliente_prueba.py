@@ -26,7 +26,11 @@ db = DatabaseManager()
 # PERSONALIZA ESTOS DATOS ANTES DE EJECUTAR
 # ─────────────────────────────────────────────────────────────────────────────
 
-CLIENTE_EMAIL = "prueba@miempresa.es"
+import os
+# Email del cliente de prueba. Lo leemos del .env para poder usar tu propio
+# correo (necesario para las pruebas con el dominio de Resend, que solo
+# permite enviar a tu dirección registrada) sin hardcodearlo en el código.
+CLIENTE_EMAIL = os.getenv("EMAIL_CLIENTE_PRUEBA", "prueba@miempresa.es")
 CLIENTE_NOMBRE = "Empresa de Prueba S.L."
 
 PERFIL_NOMBRE = "Contratos IT y desarrollo software"

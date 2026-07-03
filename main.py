@@ -39,6 +39,7 @@ from src.db_manager import DatabaseManager
 from src.scraper_atom import AtomScraper, PCPSFeedError, _esta_cerrada
 from src.downloader import PDFDownloader
 from src.utils import formatear_presupuesto
+from src.notificador import construir_email_licitacion, enviar_email
 
 logger = get_logger(__name__)
 console = Console()
@@ -328,7 +329,7 @@ def ejecutar_analisis(limite: int, dry_run: bool, db: DatabaseManager) -> dict:
                     "Error analizando licitación '%.40s' para perfil '%s': %s",
                     licit.titulo, perfil.nombre, exc,
                 )
-
+    
         # Actualizamos el estado final de la licitación.
         # Tres casos posibles (la relevancia tiene prioridad sobre el fallo):
         #   1. Algún perfil la marcó relevante → RELEVANTE
@@ -355,6 +356,84 @@ def ejecutar_analisis(limite: int, dry_run: bool, db: DatabaseManager) -> dict:
     )
     return stats
 
+# ──────────────────────────────────────────────────────────────────────────────
+# STEP 5 — NOTIFICACIONES
+# ──────────────────────────────────────────────────────────────────────────────
+
+def ejecutar_notificaciones(dry_run: bool, db: DatabaseManager) -> dict:
+    """
+    Step 5: envía un email a cada cliente por cada match relevante
+    que aún no se haya notificado.
+
+    Flujo:
+      1. Obtiene los matches pendientes (relevantes y no notificados).
+      2. Por cada uno, construye y envía el email.
+      3. Si el envío tiene éxito, marca el match como notificado
+         (para no reenviarlo en la próxima ejecución).
+    """
+    inicio = time.monotonic()
+    stats = {"enviados": 0, "errores": 0, "duracion_seg": 0.0}
+
+    # Obtenemos los datos planos (dicts) de los matches a notificar.
+    # El método ya filtra por score, notificado=False y cliente/perfil activos.
+    with db.session() as session:
+        pendientes = db.obtener_matches_para_notificar(session, limite=50)
+
+    if not pendientes:
+        logger.info("No hay matches pendientes de notificar.")
+        stats["duracion_seg"] = round(time.monotonic() - inicio, 2)
+        return stats
+
+    logger.info("Notificando %d matches pendientes...", len(pendientes))
+
+    if dry_run:
+        for datos in pendientes:
+            logger.info(
+                "[DRY-RUN NOTIF] %s ← %.50s",
+                datos["email_cliente"], datos["titulo"],
+            )
+        stats["enviados"] = len(pendientes)
+        stats["duracion_seg"] = round(time.monotonic() - inicio, 2)
+        return stats
+
+    for datos in pendientes:
+        try:
+            # Construimos el asunto y el cuerpo HTML a partir del dict.
+            asunto, cuerpo_html = construir_email_licitacion(datos)
+
+            # Enviamos el email.
+            email_id = enviar_email(
+                destinatario=datos["email_cliente"],
+                asunto=asunto,
+                cuerpo_html=cuerpo_html,
+            )
+
+            # Si el envío tuvo éxito (devolvió un id), marcamos como notificado.
+            # Si falló (None), NO lo marcamos: se reintentará en la próxima pasada.
+            if email_id:
+                with db.session() as session:
+                    db.marcar_match_notificado(session, datos["match_id"])
+                stats["enviados"] += 1
+                logger.info(
+                    "📧 Notificado %s ← %.50s",
+                    datos["email_cliente"], datos["titulo"],
+                )
+            else:
+                stats["errores"] += 1
+
+        except Exception as exc:
+            logger.error(
+                "Error notificando match %d a %s: %s",
+                datos["match_id"], datos["email_cliente"], exc,
+            )
+            stats["errores"] += 1
+
+    stats["duracion_seg"] = round(time.monotonic() - inicio, 2)
+    logger.info(
+        "Notificaciones completadas: %d enviados | %d errores",
+        stats["enviados"], stats["errores"],
+    )
+    return stats
 
 # ──────────────────────────────────────────────────────────────────────────────
 # CLI
@@ -386,6 +465,7 @@ Ejemplos:
     parser.add_argument("--solo-pdfs",       action="store_true")
     parser.add_argument("--solo-extraccion", action="store_true")
     parser.add_argument("--solo-analisis",   action="store_true")
+    parser.add_argument("--solo-notificaciones", action="store_true")
     return parser.parse_args()
 
 
@@ -417,17 +497,20 @@ def main() -> int:
         return 0
 
     # Decidimos qué steps ejecutar
-    algun_solo = args.solo_ingesta or args.solo_pdfs or args.solo_extraccion or args.solo_analisis
+    algun_solo = (args.solo_ingesta or args.solo_pdfs or args.solo_extraccion
+                  or args.solo_analisis or args.solo_notificaciones)
     ejecutar_step1 = args.solo_ingesta    or not algun_solo
     ejecutar_step2 = args.solo_pdfs       or not algun_solo
     ejecutar_step3 = args.solo_extraccion or not algun_solo
     ejecutar_step4 = args.solo_analisis   or not algun_solo
+    ejecutar_step5 = args.solo_notificaciones or not algun_solo
 
     res = {
         "ingesta":    {"nuevas": 0, "duplicadas": 0, "errores": 0, "duracion_seg": 0.0},
         "pdfs":       {"descargados": 0, "omitidos": 0, "errores": 0, "duracion_seg": 0.0},
         "extraccion": {"extraidos": 0, "errores": 0, "duracion_seg": 0.0},
         "analisis":   {"relevantes": 0, "descartadas": 0, "errores": 0, "duracion_seg": 0.0},
+        "notificaciones": {"enviados": 0, "errores": 0, "duracion_seg": 0.0},
     }
 
     if ejecutar_step1:
@@ -474,6 +557,16 @@ def main() -> int:
             f"  🗑️  Descartadas: [yellow]{res['analisis']['descartadas']}[/]\n"
             f"  ❌ Errores:     [red]{res['analisis']['errores']}[/]",
             title="🤖 Análisis IA", border_style=color, box=box.ROUNDED,
+        ))
+    if ejecutar_step5:
+        console.print(f"\n[bold]▶ Step 5 — Notificaciones[/bold]\n")
+        res["notificaciones"] = ejecutar_notificaciones(args.dry_run, db)
+        color = "green" if res["notificaciones"]["errores"] == 0 else "yellow"
+        console.print(Panel(
+            f"Step 5 en {res['notificaciones']['duracion_seg']}s\n\n"
+            f"  📧 Enviados: [green bold]{res['notificaciones']['enviados']}[/] | "
+            f"❌ Errores: [red]{res['notificaciones']['errores']}[/]",
+            title="📧 Notificaciones", border_style=color, box=box.ROUNDED,
         ))
 
     with db.session() as session:
