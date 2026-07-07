@@ -222,13 +222,25 @@ def formatear_presupuesto(importe: Optional[float]) -> str:
 
 def generar_nombre_pdf(licitacion_id: str, nombre_original: Optional[str] = None) -> str:
     """
-    Genera un nombre de fichero seguro para guardar el PDF.
-    Usa el nombre original del documento si está disponible.
+    Genera un nombre de fichero seguro y ÚNICO para guardar el PDF.
+
+    IMPORTANTE: el nombre incluye SIEMPRE un identificador derivado del
+    licitacion_id, para garantizar que dos licitaciones distintas nunca
+    generen el mismo nombre de fichero (aunque su documento se llame igual).
+    Sin esto, dos licitaciones con un documento llamado igual (ej:
+    "Documento de aprobación") colisionarían y compartirían el PDF por error.
     """
     timestamp = datetime.now().strftime("%Y%m%d")
+
+    # Identificador único derivado del licitacion_id.
+    # Usamos un hash corto para tener algo único, corto y seguro para nombres
+    # de fichero, sin depender de cómo esté formado el id (que puede ser una URL).
+    import hashlib
+    id_hash = hashlib.md5(licitacion_id.encode("utf-8")).hexdigest()[:10]
+
     if nombre_original:
         nombre_limpio = re.sub(r"[^\w\s-]", "", nombre_original).strip()
-        nombre_limpio = re.sub(r"\s+", "_", nombre_limpio)[:60]
-        return f"{timestamp}_{nombre_limpio}.pdf"
-    id_corto = re.sub(r"[^\w]", "_", licitacion_id[-20:])
-    return f"{timestamp}_{id_corto}.pdf"
+        nombre_limpio = re.sub(r"\s+", "_", nombre_limpio)[:50]
+        return f"{timestamp}_{id_hash}_{nombre_limpio}.pdf"
+
+    return f"{timestamp}_{id_hash}.pdf"
