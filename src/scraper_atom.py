@@ -267,6 +267,17 @@ class AtomScraper:
             # — Nombre descriptivo del PDF (campo UBL cbc_filename) —
             nombre_pdf = limpiar_texto(entry.get("cbc_filename"))
 
+            # — Código CPV (clasificación del contrato) —
+            # Peculiaridad de feedparser: el texto del código queda en el
+            # elemento PADRE (cac_requiredcommodityclassification), mientras
+            # que cbc_itemclassificationcode solo contiene los atributos.
+            # Si hay varios CPVs pueden venir en multilínea: tomamos el primero.
+
+            cpv_raw = entry.get("cac_requiredcommodityclassification")
+            cpv = None
+            if cpv_raw:
+                cpv = str(cpv_raw).strip().split()[0] or None
+
             # — Detección de licitación ya cerrada —
             # Si el estado indica cierre, marcamos el schema para que main.py
             # lo inserte directamente como DESCARTADA sin gastar Steps 2-4.
@@ -288,6 +299,7 @@ class AtomScraper:
                 expediente=campos_summary.get("expediente"),
                 url_pdf_directo=url_pdf,
                 nombre_pdf=nombre_pdf,
+                cpv_codigo=cpv,
                 raw_summary_html=summary_raw[:1000] if summary_raw else None,
             )
 
